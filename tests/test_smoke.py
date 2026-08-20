@@ -9,13 +9,14 @@ import pytest
 
 from ahaloop.events import EventType, LearningEvent, Visibility, append_event, read_events
 from ahaloop.llm import PROVIDER_ENV_VAR, LLMConfigurationError, OllamaClient, get_client
+from ahaloop.transcript import TranscriptError, TranscriptSegment, parse_video_id, source_ref
 
 
 def make_event(**overrides) -> LearningEvent:
     fields = {
         "event_type": EventType.AHA,
         "concept": "residual connection",
-        "source_ref": "https://youtu.be/vq5WhoPCWQ8#t=612",
+        "source_ref": "https://youtu.be/vq5WhoPCWQ8?t=612",
         "occurred_at": datetime(2026, 8, 6, 9, 30, tzinfo=UTC),
         "payload": {"note": "gradients skip the block entirely"},
     }
@@ -73,9 +74,30 @@ class TestLLM:
         assert isinstance(get_client(), OllamaClient)
 
 
+class TestTranscript:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://youtu.be/vq5WhoPCWQ8",
+            "https://www.youtube.com/watch?v=vq5WhoPCWQ8",
+            "https://www.youtube.com/watch?v=vq5WhoPCWQ8&t=612s",
+        ],
+    )
+    def test_parses_video_id_from_url_shapes(self, url: str):
+        assert parse_video_id(url) == "vq5WhoPCWQ8"
+
+    def test_url_without_video_id_is_rejected(self):
+        with pytest.raises(TranscriptError):
+            parse_video_id("https://www.youtube.com/results?search_query=openai")
+
+    def test_source_ref_truncates_backwards(self):
+        segment = TranscriptSegment(start=612.94, duration=4.48, text="...")
+
+        assert source_ref("vq5WhoPCWQ8", segment) == "https://youtu.be/vq5WhoPCWQ8?t=612"
+
+
 def test_cli_exposes_ingest():
     from ahaloop.cli import app, ingest
 
     assert app is not None
-    with pytest.raises(NotImplementedError):
-        ingest("https://youtu.be/vq5WhoPCWQ8")
+    assert callable(ingest)
