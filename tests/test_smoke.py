@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from ahaloop.events import EventType, LearningEvent, Visibility, append_event, read_events
-from ahaloop.llm import PROVIDER_ENV_VAR, LLMConfigurationError, OllamaClient, get_client
+from ahaloop.llm import (
+    CLI_COMMAND_ENV_VAR,
+    PROVIDER_ENV_VAR,
+    CLIClient,
+    LLMConfigurationError,
+    OllamaClient,
+    get_client,
+)
 from ahaloop.transcript import TranscriptError, TranscriptSegment, parse_video_id, source_ref
 
 
@@ -72,6 +80,96 @@ class TestLLM:
     def test_env_var_selects_provider(self, monkeypatch):
         monkeypatch.setenv(PROVIDER_ENV_VAR, "ollama")
         assert isinstance(get_client(), OllamaClient)
+
+    def test_cli_is_selectable(self, monkeypatch):
+        monkeypatch.setenv(PROVIDER_ENV_VAR, "cli")
+        assert isinstance(get_client(), CLIClient)
+
+
+class TestCLIClient:
+    def run_stub(self, monkeypatch, **result):
+        calls = {}
+
+        def fake_run(command, **kwargs):
+            calls["command"] = command
+            calls["input"] = kwargs.get("input")
+            if "raises" in result:
+                raise result["raises"]
+            return subprocess.CompletedProcess(
+                command,
+                result.get("returncode", 0),
+                stdout=result.get("stdout", ""),
+                stderr=result.get("stderr", ""),
+            )
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        return calls
+
+    def test_prompt_goes_over_stdin(self, monkeypatch):
+        monkeypatch.setenv(CLI_COMMAND_ENV_VAR, "claude -p")
+        calls = self.run_stub(monkeypatch, stdout="[]")
+
+        assert CLIClient().complete("extract concepts") == "[]"
+        assert calls["input"] == "extract concepts"
+        assert calls["command"] == ["claude", "-p"]
+
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [
+            ("claude -p", ["claude", "-p"]),
+            ("codex exec", ["codex", "exec"]),
+            ("ollama run llama3.2", ["ollama", "run", "llama3.2"]),
+            ("llm -m 'gpt-4o mini'", ["llm", "-m", "gpt-4o mini"]),
+        ],
+    )
+    def test_any_agent_cli_can_be_configured(self, monkeypatch, configured, expected):
+        monkeypatch.setenv(CLI_COMMAND_ENV_VAR, configured)
+        calls = self.run_stub(monkeypatch, stdout="[]")
+
+        CLIClient().complete("p")
+
+        assert calls["command"] == expected
+
+    def test_unconfigured_command_names_the_env_var(self, monkeypatch):
+        monkeypatch.delenv(CLI_COMMAND_ENV_VAR, raising=False)
+
+        with pytest.raises(LLMConfigurationError, match=CLI_COMMAND_ENV_VAR):
+            CLIClient().complete("p")
+
+    def test_options_are_not_forwarded(self, monkeypatch):
+        """Flags belong in the configured command, not in guessed arguments.
+
+        `extract_pack` always sends `temperature=0.0`. Inventing a flag for it
+        would break on most CLIs, so the option is dropped rather than guessed —
+        a limitation the class docstring states outright.
+        """
+        monkeypatch.setenv(CLI_COMMAND_ENV_VAR, "claude -p")
+        calls = self.run_stub(monkeypatch, stdout="[]")
+
+        CLIClient().complete("p", temperature=0.0, model="whatever")
+
+        assert calls["command"] == ["claude", "-p"]
+
+    def test_missing_binary_names_the_command(self, monkeypatch):
+        monkeypatch.setenv(CLI_COMMAND_ENV_VAR, "nope --run")
+        self.run_stub(monkeypatch, raises=FileNotFoundError())
+
+        with pytest.raises(LLMConfigurationError, match="nope"):
+            CLIClient().complete("p")
+
+    def test_failed_run_surfaces_stderr(self, monkeypatch):
+        monkeypatch.setenv(CLI_COMMAND_ENV_VAR, "claude -p")
+        self.run_stub(monkeypatch, returncode=1, stderr="not logged in")
+
+        with pytest.raises(LLMConfigurationError, match="not logged in"):
+            CLIClient().complete("p")
+
+    def test_timeout_is_reported(self, monkeypatch):
+        monkeypatch.setenv(CLI_COMMAND_ENV_VAR, "claude -p")
+        self.run_stub(monkeypatch, raises=subprocess.TimeoutExpired("claude", 300))
+
+        with pytest.raises(LLMConfigurationError, match="did not answer"):
+            CLIClient().complete("p")
 
 
 class TestTranscript:
